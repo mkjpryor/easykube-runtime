@@ -43,6 +43,7 @@ class Manager:
         self,
         watch: Watch,
         reconciler: Reconciler,
+        *,
         worker_pool: t.Optional[WorkerPool] = None,
         requeue_max_backoff: t.Optional[int] = None
     ) -> Controller:
@@ -76,7 +77,12 @@ class Manager:
         """
         Creates a new watch that is registered with this manager.
         """
-        watch = Watch(api_version, kind, labels = labels, namespace = namespace)
+        watch = Watch(
+            api_version,
+            kind,
+            labels = labels,
+            namespace = namespace or self._namespace
+        )
         self.register_watch(watch)
         return watch
 

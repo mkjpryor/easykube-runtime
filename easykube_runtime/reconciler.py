@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 import typing as t
 import uuid
 
@@ -41,23 +42,13 @@ class Reconciler:
     """
     Base class for a reconciler.
     """
-    async def reconcile_normal(self, obj: t.Dict[str, t.Any]) -> t.Optional[Result]:
-        """
-        Reconcile the given object.
-        """
-        raise NotImplementedError
-
-    async def reconcile_delete(self, obj: t.Dict[str, t.Any]) -> t.Optional[Result]:
-        """
-        Reconcile the deletion of the given object.
-        """
-        raise NotImplementedError
-
-    async def reconcile(self, obj: t.Dict[str, t.Any]) -> t.Optional[Result]:
+    async def reconcile(
+        self,
+        client: easykube.AsyncClient,
+        obj: t.Dict[str, t.Any],
+        logger: logging.LoggerAdapter
+    ) -> t.Optional[Result]:
         """
         Reconcile the current state of the given object.
         """
-        if obj["metadata"].get("deletionTimestamp"):
-            return await self.reconcile_delete(obj)
-        else:
-            return await self.reconcile_normal(obj)
+        raise NotImplementedError

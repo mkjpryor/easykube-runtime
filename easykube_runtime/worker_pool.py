@@ -1,78 +1,41 @@
 import asyncio
+import logging
 import typing as t
+import uuid
 
 from .util import run_tasks
 
 
-class WorkerNotAvailable(RuntimeError):
-    """
-    Raised when a task is scheduled to a worker that already has a task.
-    """
+logger = logging.getLogger(__name__)
 
 
-TaskFunc = t.Callable[..., t.Awaitable[None]]
-TaskArgs = t.Iterable[t.Any]
-TaskKwargs = t.Dict[str, t.Any]
-Task = t.Tuple[TaskFunc, TaskArgs, TaskKwargs]
+Task = t.Tuple[
+    t.Callable[..., t.Awaitable[None]],
+    t.Iterable[t.Any],
+    t.Dict[str, t.Any]
+]
 
 
-class Worker:
+class TaskCancelHandle:
     """
-    Represents a worker in a pool.
+    Cancellation handle for a task.
     """
-    def __init__(self, pool: 'WorkerPool', id: int):
+    def __init__(self, pool: 'WorkerPool', task_id: str):
         self._pool = pool
-        self._id = id
-        self._available = True
-        self._task: t.Optional[Task] = None
+        self._task_id = task_id
 
     @property
-    def id(self) -> int:
+    def task_id(self):
         """
-        The ID of the worker.
+        The ID of the task that this cancellation handle is for.
         """
-        return self._id
+        return self._task_id
 
-    @property
-    def available(self) -> bool:
+    def cancel(self):
         """
-        Indicates whether the worker is available.
+        Cancel the task referred to by this handle.
         """
-        return self._available and not self._task
-
-    def reserve(self) -> 'Worker':
-        """
-        Reserve the worker by marking it as unavailable, even if no task is set yet.
-        """
-        self._available = False
-        return self
-
-    def set_task(self, func: TaskFunc, *args: TaskArgs, **kwargs: TaskKwargs) -> 'Worker':
-        """
-        Run the specified function call using the worker.
-        """
-        if self._task:
-            raise WorkerNotAvailable
-        else:
-            self._task = (func, args, kwargs)
-            return self
-
-    async def run(self):
-        """
-        Run the worker.
-        """
-        # We run forever, picking up and executing our task as it is set
-        while True:
-            if self._task:
-                func, args, kwargs = self._task
-                try:
-                    await func(*args, **kwargs)
-                finally:
-                    self._available = True
-                    self._task = None
-            else:
-                # Just relinquish control for now to allow another coroutine to run
-                await asyncio.sleep(0.1)
+        self._pool.cancel(self)
 
 
 class WorkerPool:
@@ -80,22 +43,62 @@ class WorkerPool:
     Represents a worker pool.
     """
     def __init__(self, worker_count):
-        self._workers = [Worker(self, idx) for idx in range(worker_count)]
+        self._worker_count = worker_count
+        # A map of task ID to task for the tasks in the queue
+        # To remove a task from the queue, it is sufficient to remove it from this map
+        # When the task ID reaches the top of the queue it will be ignored if the task is gone
+        self._tasks: t.Dict[str, Task] = {}
+        # A queue of task IDs in the order they should be processed
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
 
-    async def reserve(self) -> Worker:
+    def schedule(
+        self,
+        func: t.Callable[..., t.Awaitable[None]],
+        *args: t.Any,
+        **kwargs: t.Any
+    ) -> TaskCancelHandle:
         """
-        Returns an available worker or spins until one becomes available.
+        Schedule the specified task to run when a worker becomes available.
+
+        Returns an object that can be used to cancel the task.
         """
+        task_id = str(uuid.uuid4())
+        self._tasks[task_id] = (func, args, kwargs)
+        self._queue.put_nowait(task_id)
+        return TaskCancelHandle(self, task_id)
+
+    def cancel(self, handle: TaskCancelHandle):
+        """
+        Cancel the task referred to by the given cancellation handle.
+
+        Note that this only allows tasks in the queue to be cancelled. Once a task
+        has begun executing it cannot (currently) be cancelled.
+        """
+        self._tasks.pop(handle.task_id, None)
+
+    async def _worker(self, id: int):
+        """
+        Run a single worker.
+        """
+        # Just continuously pull a task from the queue and process it
         while True:
-            try:
-                worker = next(w for w in self._workers if w.available)
-            except StopIteration:
-                await asyncio.sleep(0.1)
-            else:
-                return worker.reserve()
+            task_id = await self._queue.get()
+            task = self._tasks.pop(task_id, None)
+            if task:
+                func, args, kwargs = task
+                try:
+                    await func(*args, **kwargs, worker_id = id)
+                except:
+                    logger.exception("exception occurred during task execution")
+            self._queue.task_done()
 
     async def run(self):
         """
         Run the workers in the pool.
         """
-        await run_tasks([asyncio.create_task(w.run()) for w in self._workers])
+        await run_tasks(
+            [
+                asyncio.create_task(self._worker(worker_id))
+                for worker_id in range(self._worker_count)
+            ]
+        )

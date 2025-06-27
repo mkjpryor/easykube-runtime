@@ -24,13 +24,14 @@ class Queue:
          The queue records when a request leaves the queue and does not allow any more requests
          for the same object to leave the queue until it has been notified that the
          previous request has been completed (either explicitly or by requeuing).
-
-    Note that this means that requests for objects that are changing often will be pushed to
-    the back of the queue.
     """
     def __init__(self):
-        # The main queue of (request, attempt) tuples
-        self._queue: t.List[t.Tuple[Request, int]] = []
+        # The requests in the queue, indexed by key
+        self._requests: t.Dict[str, t.Tuple[Request, int]] = {}
+        # Queue containing the keys in the order in which they should be processed
+        # This allows us to efficiently replace the actual request for a key while maintaining
+        # the order in which keys are processed to ensure no keys are starved
+        self._queue: t.List[str] = []
         # A queue of futures
         # Each waiting "dequeuer" adds a future to the queue and waits on it
         # When a request becomes available, the first future in the queue is resolved, which
@@ -40,25 +41,6 @@ class Queue:
         self._active: t.Dict[str, str] = {}
         # A map of request key to handles for requeue callbacks
         self._handles: t.Dict[str, asyncio.TimerHandle] = {}
-
-    def _eligible_idx(self):
-        """
-        Returns the index of the first request in the queue that is eligible to be dequeued.
-        """
-        return next(
-            (
-                i
-                for i, (req, _) in enumerate(self._queue)
-                if req.key not in self._active
-            ),
-            -1
-        )
-
-    def has_eligible_request(self):
-        """
-        Indicates if the queue has a request that is eligible to be dequeued.
-        """
-        return self._eligible_idx() >= 0
 
     def _wakeup_next_dequeue(self):
         """
@@ -77,68 +59,56 @@ class Queue:
         If there are no requests that are eligible to leave the queue, wait until there is one.
         """
         while True:
-            # Find the index of the first request in the queue for which there is no active task
-            idx = self._eligible_idx()
-            # If there is such a request, extract it from the queue and return it
+            # Find the index of the first key in the queue for which there is no active task
+            idx = next((i for i, key in enumerate(self._queue) if key not in self._active), -1)
+            # If there is such a key, extract it from the queue and return it
             if idx >= 0:
-                request, attempt = self._queue.pop(idx)
+                key = self._queue.pop(idx)
+                request, attempt = self._requests.pop(key)
                 # Register the request as having an active processing task
                 self._active[request.key] = request.id
                 return (request, attempt)
-            # If there is no such request, wait to be woken up when the situation changes
-            future = asyncio.get_running_loop().create_future()
-            self._futures.append(future)
-            await future
+            else:
+                # If there is no such key, wait to be woken up when the situation changes
+                future = asyncio.get_running_loop().create_future()
+                self._futures.append(future)
+                await future
+
+    def _cancel_requeue(self, key: str):
+        # Cancel and discard any requeue handle for the same key
+        handle = self._handles.pop(key, None)
+        if handle:
+            handle.cancel()
 
     def _do_enqueue(self, request: Request, attempt: int = 0):
-        # Cancel any pending requeues for the same request
-        self._cancel_requeue(request)
-        # Append the request to the queue
-        self._queue.append((request, attempt))
-        # Wake up the next waiting dequeuer
+        # Cancel any pending requeues for the same key
+        self._cancel_requeue(request.key)
+        # Check if there is already a request with the same key in the queue
+        if request.key in self._requests:
+            # If the key is already in the queue, keep the request with the fewest retries
+            # The key stays at the same place in the queue
+            _, current_attempt = self._requests[request.key]
+            if attempt <= current_attempt:
+                self._requests[request.key] = (request, attempt)
+        else:
+            # If the key is not in the queue, add it to the back
+            self._requests[request.key] = (request, attempt)
+            self._queue.append(request.key)
+        # Wake up the next waiting dequeuer
         self._wakeup_next_dequeue()
 
     def enqueue(self, request: Request):
         """
         Add a new request to the queue.
         """
-        # If a request with the same key is in the queue, discard it
-        idx = next(
-            (
-                i
-                for i, (req, _) in enumerate(self._queue)
-                if req.key == request.key
-            ),
-            -1
-        )
-        if idx >= 0:
-            self._queue.pop(idx)
-        # Add the new request to the end of the queue
-        self._do_enqueue(request)
-
-    def _do_requeue(self, request: Request, attempt: int):
-        # If a request with the same key is already in the queue, discard this one
-        # If not, enqueue it
-        if not any(req.key == request.key for req, _ in self._queue):
-            self._do_enqueue(request, attempt)
-        else:
-            self._cancel_requeue(request)
-
-    def _cancel_requeue(self, request: Request):
-        # Cancel and discard any requeue handle for the request
-        handle = self._handles.pop(request.key, None)
-        if handle:
-            handle.cancel()
+        return self._do_enqueue(request)
 
     def requeue(self, request: Request, attempt: int, delay: int):
         """
         Requeue a request after the specified delay.
-
-        If a request with the same key is already in the queue when the delay has elapsed,
-        the request is discarded.
         """
         # If there is already an existing requeue handle, cancel it
-        self._cancel_requeue(request)
+        self._cancel_requeue(request.key)
         # If there is already a request with the same key on the queue, there is nothing to do
         # If not, schedule a requeue after a delay
         #
@@ -146,11 +116,11 @@ class Queue:
         # We use a callback rather than a task to schedule the requeue
         # This is because it allows us to cancel the requeue cleanly without trapping
         # CancelledError, allowing the controller as a whole to be cancelled reliably
-        if not any(req.key == request.key for req, _ in self._queue):
+        if request.key not in self._requests:
             # Schedule the requeue for the future and stash the handle
             self._handles[request.key] = asyncio.get_running_loop().call_later(
                 delay,
-                self._do_requeue,
+                self._do_enqueue,
                 request,
                 attempt
             )

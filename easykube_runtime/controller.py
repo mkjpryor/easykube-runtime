@@ -12,9 +12,6 @@ from .watch import Watch, WatchCallback, WatchEvent
 from .worker_pool import WorkerPool
 
 
-logger = logging.getLogger(__name__)
-
-
 #: Type for a function that takes a Kubernetes object and returns an iterable of reconciliation
 #: requests for objects of the controller type
 ObjectRequestMapper = t.Callable[[t.Dict[str, t.Any]], t.Iterable[Request]]
@@ -75,21 +72,6 @@ class Controller:
         """
         watch.subscribe(self._watch_callback(mapper))
 
-    def _request_logger(self, request: Request, worker_id: int):
-        """
-        Returns a logger for the given request.
-        """
-        return logging.LoggerAdapter(
-            logger,
-            {
-                "api_version": self.api_version,
-                "kind": self.kind,
-                "instance": request.key,
-                "request_id": request.id,
-                "worker_id": worker_id,
-            }
-        )
-
     async def _fetch_obj(
         self,
         client: easykube.AsyncClient,
@@ -109,19 +91,28 @@ class Controller:
             else:
                 raise
 
-    
     async def _handle_request(
         self,
         client: easykube.AsyncClient,
-        worker_id: int,
         request: Request,
-        attempt: int
+        attempt: int,
+        *,
+        worker_id: int
     ):
         """
         Start a worker that processes reconcile requests.
         """
         # Get a logger that populates parameters for the request
-        logger = self._request_logger(request, worker_id)
+        logger = logging.LoggerAdapter(
+            logging.getLogger(__name__),
+            {
+                "api_version": self.api_version,
+                "kind": self.kind,
+                "instance": request.key,
+                "request_id": request.id,
+                "worker_id": worker_id,
+            }
+        )
         logger.info("Handling reconcile request (attempt %d)", attempt + 1)
         # Try to reconcile the request
         try:
@@ -129,7 +120,7 @@ class Controller:
             obj = await self._fetch_obj(client, request)
             if obj:
                 # Then try to reconcile the object
-                result = await self._reconciler.reconcile(obj)
+                result = await self._reconciler.reconcile(client, obj, logger)
             else:
                 # Log the missing object and discard the event
                 logger.warning("Object no longer exists")
@@ -138,7 +129,7 @@ class Controller:
             # Propagate cancellations with no further action
             raise
         except Exception:
-            logger.exception("Error handling reconcile request")
+            logger.exception("Unexpected error while handling reconcile request")
             result = Result(True)
         else:
             # If the result is None, use the default result
@@ -154,7 +145,7 @@ class Controller:
             logger.info("Requeuing request after %.3fs", delay)
             self._queue.requeue(request, attempt + 1, delay)
         else:
-            logger.info("Successfully handled reconcile request")
+            logger.info("Successfully processed reconcile request")
             # Mark the processing for the request as complete
             self._queue.processing_complete(request)
 
@@ -163,15 +154,10 @@ class Controller:
         Run the controller using the given client.
         """
         # We just need to pull requests from the queue and dispatch them to the worker pool
+        # Because of how the queue works, this means there will be at most one task per
+        # object scheduled with the worker pool
         while True:
             # Spin until there is a request in the queue that is eligible to be dequeued
-            while not self._queue.has_eligible_request():
-                await asyncio.sleep(0.1)
-            # Once we know there is an eligible request, wait to reserve a worker
-            # We don't want to actually dequeue the request until we know we have a worker
-            # as it may be replaced by a newer, still eligible, request while we wait
-            worker = await self._worker_pool.reserve()
-            # Once we know we have a worker reserved, pull the next eligible request from the
-            # queue and give the task to the worker to process asynchronously
             request, attempt = await self._queue.dequeue()
-            worker.set_task(self._handle_request, client, worker.id, request, attempt)
+            # Schedule the work to process the request
+            self._worker_pool.schedule(self._handle_request, client, request, attempt)
