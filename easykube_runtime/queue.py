@@ -80,7 +80,7 @@ class Queue:
         if handle:
             handle.cancel()
 
-    def _do_enqueue(self, request: Request, attempt: int = 0):
+    def _do_enqueue(self, request: Request, attempt: int):
         # Cancel any pending requeues for the same key
         self._cancel_requeue(request.key)
         # Check if there is already a request with the same key in the queue
@@ -101,7 +101,7 @@ class Queue:
         """
         Add a new request to the queue.
         """
-        return self._do_enqueue(request)
+        return self._do_enqueue(request, 0)
 
     def requeue(self, request: Request, attempt: int, delay: int):
         """

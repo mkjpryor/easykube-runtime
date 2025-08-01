@@ -40,7 +40,7 @@ class Result:
 
 class Reconciler:
     """
-    Base class for a reconciler.
+    Interface for reconcilers.
     """
     async def reconcile(
         self,
@@ -52,3 +52,108 @@ class Reconciler:
         Reconcile the current state of the given object.
         """
         raise NotImplementedError
+
+
+class BaseReconciler(Reconciler):
+    """
+    Base class for reconcilers.
+    """
+    def __init__(self, finalizer: str):
+        self._finalizer = finalizer
+
+    async def reconcile_normal(
+        self,
+        client: easykube.AsyncClient,
+        obj: t.Dict[str, t.Any],
+        logger: logging.LoggerAdapter
+    ) -> t.Tuple[t.Dict[str, t.Any], t.Optional[Result]]:
+        """
+        Reconcile the given object and return a tuple of the updated object and a result.
+        """
+        raise NotImplementedError
+
+    async def reconcile_delete(
+        self,
+        client: easykube.AsyncClient,
+        obj: t.Dict[str, t.Any],
+        logger: logging.LoggerAdapter
+    ) -> t.Tuple[t.Dict[str, t.Any], t.Optional[Result]]:
+        """
+        Reconcile the deletion of the given object and return a tuple of the updated object
+        and a result.
+        """
+        raise NotImplementedError
+
+    async def reconcile(
+        self,
+        client: easykube.AsyncClient,
+        obj: t.Dict[str, t.Any],
+        logger: logging.LoggerAdapter
+    ) -> t.Optional[Result]:
+        """
+        Reconcile the current state of the given object.
+        """
+        deletion_timestamp = obj["metadata"].get("deletionTimestamp")
+        if not deletion_timestamp:
+            logger.info("Reconciling object")
+            obj = await self.ensure_finalizer(client, obj)
+            _, result = await self.reconcile_normal(client, obj, logger)
+            return result
+        else:
+            logger.info("Reconciling object deletion")
+            obj, result = await self.reconcile_delete(client, obj, logger)
+            # If the delete was reconciled without a requeue, remove the finalizer
+            if not result or not result.requeue:
+                _ = await self.remove_finalizer(client, obj)
+            return result
+
+    async def ensure_finalizer(
+        self,
+        client: easykube.AsyncClient,
+        obj: t.Dict[str, t.Any]
+    ) -> t.Dict[str, t.Any]:
+        """
+        Ensure our finalizer is present on the given object.
+        """
+        finalizers = obj["metadata"].get("finalizers", [])
+        if self._finalizer not in finalizers:
+            return await client.replace_object(
+                {
+                    **obj,
+                    "metadata": {
+                        **obj["metadata"],
+                        "finalizers": [
+                            *finalizers,
+                            self._finalizer
+                        ],
+                    },
+                }
+            )
+        else:
+            return obj
+
+    async def remove_finalizer(
+        self,
+        client: easykube.AsyncClient,
+        obj: t.Dict[str, t.Any]
+    ) -> t.Dict[str, t.Any]:
+        """
+        Remove our finalizer from the given object.
+        """
+        finalizers = obj["metadata"].get("finalizers", [])
+        if self._finalizer in finalizers:
+            return await client.replace_object(
+                {
+                    **obj,
+                    "metadata": {
+                        **obj["metadata"],
+                        "finalizers": [
+                            f
+                            for f in finalizers
+                            if f != self._finalizer
+                        ],
+                    },
+                }
+            )
+        else:
+            return obj

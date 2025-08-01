@@ -28,7 +28,7 @@ WatchCancelHandle = t.Callable[[], None]
 
 class Watch:
     """
-    Watches a Kubernetes resource and produces reconcile requests.
+    Watches a Kubernetes resource and produces watch events.
     """
     def __init__(
         self,

@@ -129,6 +129,7 @@ class Controller:
             # Propagate cancellations with no further action
             raise
         except Exception:
+            # For all other errors, requeue the request
             logger.exception("Unexpected error while handling reconcile request")
             result = Result(True)
         else:

@@ -74,7 +74,7 @@ def map_owners(
 TCustomResource = t.TypeVar("TCustomResource", bound = kcr.CustomResource)
 
 
-class CustomResourceReconciler(easykube_runtime.Reconciler, t.Generic[TCustomResource]):
+class CustomResourceReconciler(easykube_runtime.BaseReconciler, t.Generic[TCustomResource]):
     """
     Base class for custom resource reconcilers.
     """
@@ -88,12 +88,12 @@ class CustomResourceReconciler(easykube_runtime.Reconciler, t.Generic[TCustomRes
         self._api_group = api_group
         self._model = model
         # Use the full name of the resource as the finalizer
-        self._finalizer = (
+        super().__init__(
             finalizer or
             f"{model._meta.plural_name}.{get_full_api_group(api_group, model)}/finalizer"
         )
 
-    async def reconcile_normal(
+    async def reconcile_instance_normal(
         self,
         client: easykube.AsyncClient,
         instance: TCustomResource,
@@ -104,7 +104,7 @@ class CustomResourceReconciler(easykube_runtime.Reconciler, t.Generic[TCustomRes
         """
         raise NotImplementedError
 
-    async def reconcile_delete(
+    async def reconcile_instance_delete(
         self,
         client: easykube.AsyncClient,
         instance: TCustomResource,
@@ -116,65 +116,44 @@ class CustomResourceReconciler(easykube_runtime.Reconciler, t.Generic[TCustomRes
         """
         raise NotImplementedError
 
+    async def reconcile_normal(
+        self,
+        client: easykube.AsyncClient,
+        obj: t.Dict[str, t.Any],
+        logger: logging.LoggerAdapter
+    ) -> t.Tuple[t.Dict[str, t.Any], t.Optional[easykube_runtime.Result]]:
+        # Validate the incoming object
+        instance = self._model.model_validate(obj)
+        instance, result = await self.reconcile_instance_normal(client, instance, logger)
+        # Dump the model on the way back out
+        return instance.model_dump(exclude_defaults = True), result
+
+    async def reconcile_delete(
+        self,
+        client: easykube.AsyncClient,
+        obj: t.Dict[str, t.Any],
+        logger: logging.LoggerAdapter
+    ) -> t.Tuple[t.Dict[str, t.Any], t.Optional[easykube_runtime.Result]]:
+        # Validate the incoming object
+        instance = self._model.model_validate(obj)
+        instance, result = await self.reconcile_instance_delete(client, instance, logger)
+        # Dump the model on the way back out
+        return instance.model_dump(exclude_defaults = True), result
+
     async def reconcile(
         self,
         client: easykube.AsyncClient,
         obj: t.Dict[str, t.Any],
         logger: logging.LoggerAdapter
     ) -> t.Optional[easykube_runtime.Result]:
-        # First, parse the object using the model class
-        # If it doesn't parse, discard the event
+        # Run the logic from the parent, but catch any validation errors
         try:
-            instance = self._model.model_validate(obj)
+            _, result = super().reconcile(client, obj, logger)
         except pydantic.ValidationError:
             logger.exception("Object validation failed")
             return easykube_runtime.Result()
-        # Reconcile the instance using the appropriate method
-        # We apply or unapply the finalizer as required
-        if not instance.metadata.deletion_timestamp:
-            logger.info("Reconciling instance")
-            instance = await self.ensure_finalizer(client, instance)
-            _, result = await self.reconcile_normal(client, instance, logger)
+        else:
             return result
-        else:
-            logger.info("Reconciling instance deletion")
-            instance, result = await self.reconcile_delete(client, instance, logger)
-            # If the delete was reconciled without a requeue, remove the finalizer
-            if not result.requeue:
-                _ = await self.remove_finalizer(client, instance)
-            return result
-
-    async def ensure_finalizer(
-        self,
-        client: easykube.AsyncClient,
-        instance: TCustomResource
-    ) -> TCustomResource:
-        """
-        Ensures that the specified finalizer is present on the given instance.
-        The updated instance is returned.
-        """
-        if self._finalizer not in instance.metadata.finalizers:
-            instance.metadata.finalizers.append(self._finalizer)
-            return await self.save_instance(client, instance)
-        else:
-            return instance
-
-    async def remove_finalizer(
-        self,
-        client: easykube.AsyncClient,
-        instance: TCustomResource
-    ) -> TCustomResource:
-        """
-        Ensures that the specified finalizer is not present on the given instance.
-        The updated instance is returned.
-        """
-        try:
-            idx = instance.metadata.finalizers.index(self._finalizer)
-        except ValueError:
-            return instance
-        else:
-            instance.metadata.finalizers.pop(idx)
-            return await self.save_instance(client, instance)
 
     async def ekresource(
         self,
