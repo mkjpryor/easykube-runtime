@@ -39,7 +39,7 @@ async def register_crds(
     registry.discover_models(models_module)
     for crd in registry:
         obj = crd.kubernetes_resource(include_defaults = include_defaults)
-        await client.apply_object(obj)
+        await client.apply_object(obj, force = True)
     return registry
 
 
