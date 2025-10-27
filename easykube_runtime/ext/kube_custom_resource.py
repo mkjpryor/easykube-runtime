@@ -148,12 +148,10 @@ class CustomResourceReconciler(easykube_runtime.BaseReconciler, t.Generic[TCusto
     ) -> t.Optional[easykube_runtime.Result]:
         # Run the logic from the parent, but catch any validation errors
         try:
-            _, result = super().reconcile(client, obj, logger)
+            return await super().reconcile(client, obj, logger)
         except pydantic.ValidationError:
             logger.exception("Object validation failed")
             return easykube_runtime.Result()
-        else:
-            return result
 
     async def ekresource(
         self,
